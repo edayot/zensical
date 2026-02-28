@@ -89,14 +89,14 @@ def parse_config(path: str) -> dict:
     return parse_mkdocs_config(path)
 
 
-def try_decode(e: tomllib.TOMLDecodeError) -> tuple[int, int] | None:
+def try_decode(e: tomllib.TOMLDecodeError) -> tuple[str, int, int] | None:
     """
     Reverse the tomlib error message in version before 3.14 to extract line and column information, if available.
     
     In python 3.14 and later, the TOMLDecodeError includes lineno and colno attributes, so we can directly return those.
     """
     if sys.version_info >= (3, 14):
-        return (e.lineno, e.colno)
+        return (e.msg, e.lineno, e.colno)
     else:
         message = e.args[0]
         if "at line " in message and ", column " in message:
@@ -105,7 +105,8 @@ def try_decode(e: tomllib.TOMLDecodeError) -> tuple[int, int] | None:
                 column_part = message.split(", column ")[1].split(")")[0]
                 line = int(line_part)
                 column = int(column_part)
-                return line, column
+                msg = message.split("(at line ")[0].strip()
+                return (msg, line, column)
             except (IndexError, ValueError):
                 pass
         return None
@@ -119,8 +120,8 @@ def parse_zensical_config(path: str) -> dict:
             config = tomllib.load(f)
         except tomllib.TOMLDecodeError as e:
             pos = try_decode(e)
-            pos_text = f":{pos[0]}:{pos[1]}" if pos else ""
-            message = f"Provided config is not a valid toml {path}{pos_text}"
+            pos_text = f":{pos[1]}:{pos[2]}" if pos else ""
+            message = f"Provided config is not a valid TOML file : {path}{pos_text} {pos[0] if pos else str(e)}"
             if _CONFIG is None:
                 raise ConfigurationError(message) from e
             else:
@@ -138,7 +139,7 @@ def parse_mkdocs_config(path: str) -> dict:
     """Parse mkdocs.yml configuration file."""
     global _CONFIG  # noqa: PLW0603
     with open(path, encoding="utf-8") as f:
-        config = _yaml_load(f)
+        config = _yaml_load(f, filepath=path)
 
     # Apply defaults and return parsed configuration
     return _apply_defaults_and_set_global(config, path)
@@ -843,7 +844,7 @@ def _convert_plugins(value: Any, config: dict) -> dict:
 
 
 def _yaml_load(
-    source: IO, loader: type[BaseLoader] | None = None
+    source: IO, loader: type[BaseLoader] | None = None, filepath: str | None = None
 ) -> dict[str, Any]:
     """Load configuration file, resolve environment variables and parent files.
 
@@ -862,6 +863,14 @@ def _yaml_load(
             .replace("materialx", "zensical.extensions"),
             Loader=Loader,  # noqa: S506
         )
+    except yaml.MarkedYAMLError as e:
+        if not e.problem_mark or not e.context_mark:
+            raise ConfigurationError(
+                f"Encountered an error parsing the configuration file: {e}"
+            ) from e
+        pos = f":{e.problem_mark.line + 1}:{e.problem_mark.column + 1}"
+        message = f"Provided config is not a valid YAML file: {filepath}{pos} {e.problem or str(e)}"
+        raise ConfigurationError(message) from e
     except YAMLError as e:
         raise ConfigurationError(
             f"Encountered an error parsing the configuration file: {e}"
@@ -881,7 +890,7 @@ def _yaml_load(
                 f"doesn't exist at '{abspath}'."
             )
         with open(abspath, encoding="utf-8") as fd:
-            parent = _yaml_load(fd, loader)
+            parent = _yaml_load(fd, loader, filepath=abspath)
         config = always_merger.merge(parent, config)
 
     # Return resulting configuration
