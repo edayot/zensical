@@ -29,6 +29,7 @@ import os
 import pickle
 from importlib.util import find_spec
 from pathlib import Path
+import sys
 from typing import IO, TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -88,17 +89,49 @@ def parse_config(path: str) -> dict:
     return parse_mkdocs_config(path)
 
 
+def try_decode(e: tomllib.TOMLDecodeError) -> tuple[int, int] | None:
+    """
+    Reverse the tomlib error message in version before 3.14 to extract line and column information, if available.
+    
+    In python 3.14 and later, the TOMLDecodeError includes lineno and colno attributes, so we can directly return those.
+    """
+    if sys.version_info >= (3, 14):
+        return (e.lineno, e.colno)
+    else:
+        message = e.args[0]
+        if "at line " in message and ", column " in message:
+            try:
+                line_part = message.split("at line ")[1].split(", column ")[0]
+                column_part = message.split(", column ")[1].split(")")[0]
+                line = int(line_part)
+                column = int(column_part)
+                return line, column
+            except (IndexError, ValueError):
+                pass
+        return None
+
+
 def parse_zensical_config(path: str) -> dict:
     """Parse zensical.toml configuration file."""
     global _CONFIG  # noqa: PLW0603
     with open(path, "rb") as f:
-        config = tomllib.load(f)
+        try: 
+            config = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            pos = try_decode(e)
+            pos_text = f":{pos[0]}:{pos[1]}" if pos else ""
+            message = f"Provided config is not a valid toml {path}{pos_text}"
+            if _CONFIG is None:
+                raise ConfigurationError(message) from e
+            else:
+                # Fallback to the last good config
+                print(f"Warning: {message}. Falling back to last valid configuration.")
+                return _CONFIG
     if "project" in config:
         config = config["project"]
 
     # Apply defaults and return parsed configuration
-    _CONFIG = _apply_defaults(config, path)
-    return _CONFIG
+    return _apply_defaults_and_set_global(config, path)  
 
 
 def parse_mkdocs_config(path: str) -> dict:
@@ -108,8 +141,7 @@ def parse_mkdocs_config(path: str) -> dict:
         config = _yaml_load(f)
 
     # Apply defaults and return parsed configuration
-    _CONFIG = _apply_defaults(config, path)
-    return _CONFIG
+    return _apply_defaults_and_set_global(config, path)
 
 
 def get_config() -> dict:
@@ -133,6 +165,22 @@ def get_custom_theme_dir(config: dict) -> str | None:
     # Otherwise, return no path
     return None
 
+
+def _apply_defaults_and_set_global(config: dict, path: str) -> dict:
+    """Apply default settings in configuration."""
+    global _CONFIG  # noqa: PLW0603
+    try:
+        config = _apply_defaults(config, path)
+    except ConfigurationError as e:
+        message = f"Configuration error in {path}: {e}"
+        if _CONFIG is None:
+            raise ConfigurationError(message) from e
+        else:
+            # Fallback to the last good config
+            print(f"Warning: {message}. Falling back to last valid configuration.")
+            return _CONFIG
+    _CONFIG = config
+    return _CONFIG     
 
 def _apply_defaults(config: dict, path: str) -> dict:
     """Apply default settings in configuration.
